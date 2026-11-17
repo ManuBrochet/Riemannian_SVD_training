@@ -14,7 +14,7 @@ LR_MAP = {
     "Adam":      0.0005,
     "Reduced_network": 0.1,
     "Reduced_network_iso": 0.01,
-    "SGD": 0.001,
+    "SGD": 0.05,
 }
 
 # Each dict in this list is one experimental configuration.
@@ -22,7 +22,7 @@ LR_MAP = {
 PARAM_GRID = {
     # Can be "Adam", "Reduced_network", "SGD"
     "optimizer_choice": ["Adam", "SGD", "Reduced_network"],
-    # "optimizer_choice": ["Adam"],
+    # "optimizer_choice": ["Reduced_network"],
     "tanh_loss":        [False],
     "use_momentum":     [True],
     # Ignored when use_momentum == False
@@ -31,25 +31,27 @@ PARAM_GRID = {
     "proportion_dead_neurons" : [0.5],
     "LR_UV":            [0.1],
     "LR_UV_iso":            [0.1],
-    "sigma_sizes":       [[40, 24, 4]],
+    "sigma_sizes":       [[36, 24, 4]],
     # à checker
     "taille_couches":      [[120, 84], [69, 40]],
-    "adaptive_step":    [True],
+    "adaptive_step":    [False],
     "beta2":            [0.9],
-    # "seed":             list(range(2))
-    "seed":             [0]
+    "seed":             list(range(50))
 }
 
 DEFAULT_CFG = dict(
     # HIDDEN_SIZE             = 44,     # Approx 5000 parameters
     EPOCHS                  = 501,
-    STATS_EVERY             = 5,
-    BATCH_SIZE              = 128,
+    STATS_EVERY             = 1,
+    BATCH_SIZE              = 1024,
     dataset                 = "SVHN",
     # Early stopping params
     early_stopping          = True,
     patience                = 15,
-    min_delta               = 1e-4
+    min_delta               = 1e-4,
+    grad_clip_norm          = 5.0,
+    logsigma_clamp          = (-3.0, 3.0),
+    dead_layer_threshold    = 0.98
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

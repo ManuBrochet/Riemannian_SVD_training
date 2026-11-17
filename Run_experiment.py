@@ -6,6 +6,7 @@ import copy
 
 import utils_math
 import building_network, utils_Riem_opti, load_data, utils_pytorch, utils_math
+import fast_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,7 +22,7 @@ def apply_optimizer(model, cfg, pt_optimizer, first_iteration, adaptative_step, 
         building_network.reduced_network_optimizer(
             model, cfg["LR"], cfg["LR_UV"],
             cfg["beta_momentum"], cfg["use_momentum"], first_iteration,
-            adaptative_step, beta2
+            adaptative_step, beta2, logsigma_clamp=cfg.get("logsigma_clamp")
         )
     elif cfg["optimizer_choice"] == "SGD":
         building_network.basic_optimizer(
@@ -31,13 +32,38 @@ def apply_optimizer(model, cfg, pt_optimizer, first_iteration, adaptative_step, 
     elif cfg["optimizer_choice"] == "Reduced_network_iso":
         building_network.reduced_network_optimizer_iso(
             model, cfg["LR"], cfg["LR_UV_iso"],
-            cfg["beta_momentum"], cfg["use_momentum"], first_iteration
+            cfg["beta_momentum"], cfg["use_momentum"], first_iteration,
+            logsigma_clamp=cfg.get("logsigma_clamp")
         )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+def _gpu_loaders(dataset_name, batch_size, validation_split, seed):
+    """Build GPU-resident loaders for `dataset_name`.
+
+    Uses torchvision only to read the raw arrays; no transform pipeline runs,
+    because normalisation happens on the device inside fast_data.GPULoader.
+    """
+    from torchvision import datasets as _tv
+
+    if dataset_name in ("CIFAR10", "CIFAR100"):
+        cls = _tv.CIFAR10 if dataset_name == "CIFAR10" else _tv.CIFAR100
+        train = cls(root="./data", train=True, download=True)
+        test = cls(root="./data", train=False, download=True)
+    elif dataset_name == "SVHN":
+        train = _tv.SVHN(root="./data", split="train", download=True)
+        test = _tv.SVHN(root="./data", split="test", download=True)
+    else:
+        train = _tv.FashionMNIST(root="./data", train=True, download=True)
+        test = _tv.FashionMNIST(root="./data", train=False, download=True)
+
+    return fast_data.build_loaders(train, test, dataset_name, batch_size,
+                                   validation_split=validation_split, seed=seed)
 
 
 def run_experiment(cfg: dict, verbose=False, save_model=False,
@@ -79,24 +105,18 @@ def run_experiment(cfg: dict, verbose=False, save_model=False,
 
     if cfg["dataset"] == "CIFAR10":
         dataset_sizes = [3, 400, 10]
-        train_loader, validation_loader, test_loader = load_data.load_CIFAR_10(
-            cfg["BATCH_SIZE"],
-            validation_split=validation_split,
-            seed=seed,
+        train_loader, validation_loader, test_loader = _gpu_loaders(
+            "CIFAR10", cfg["BATCH_SIZE"], validation_split, seed
         )
     elif cfg["dataset"] == "CIFAR100":
         dataset_sizes = [3, 400, 100]
-        train_loader, validation_loader, test_loader = load_data.load_CIFAR_100(
-            cfg["BATCH_SIZE"],
-            validation_split=validation_split,
-            seed=seed,
+        train_loader, validation_loader, test_loader = _gpu_loaders(
+            "CIFAR100", cfg["BATCH_SIZE"], validation_split, seed
         )
     elif cfg["dataset"] == "SVHN":
-        dataset_sizes = [3, 400, 100]
-        train_loader, validation_loader, test_loader = load_data.load_SVHN(
-            cfg["BATCH_SIZE"],
-            validation_split=validation_split,
-            seed=seed,
+        dataset_sizes = [3, 400, 10]
+        train_loader, validation_loader, test_loader = _gpu_loaders(
+            "SVHN", cfg["BATCH_SIZE"], validation_split, seed
         )
     # else:
     #     dataset_sizes = [1, 256, 10]
@@ -131,6 +151,7 @@ def run_experiment(cfg: dict, verbose=False, save_model=False,
     loss_curve = []
     val_curve = []
     dead_stats = []
+    diagnostics_log = []  # populated only if cfg["debug_diagnostics"] is True
 
     # ── Early stopping variables ──────────────────────────────────────────────
     best_val_loss = float("inf")
@@ -155,6 +176,40 @@ def run_experiment(cfg: dict, verbose=False, save_model=False,
             loss = criterion(logits, labels)
             loss.backward()
 
+            # Snapshot Sigma / gradient / orthogonality stats BEFORE the
+            # step, while the gradients that are about to be applied are
+            # still populated. Cheap enough to run every batch for a
+            # single debug seed; leave cfg["debug_diagnostics"] unset
+            # (or False) for full benchmark sweeps.
+            if cfg.get("debug_diagnostics", False):
+                diagnostics_log.append({
+                    "epoch": epoch,
+                    "loss": loss.item() if torch.isfinite(loss) else float("nan"),
+                    **utils_math.log_training_diagnostics(model),
+                })
+
+            if not torch.isfinite(loss):
+                print(
+                    f"[seed {seed}] epoch {epoch}: loss is non-finite "
+                    f"({loss.item()}) — aborting this run."
+                )
+                elapsed = round(time.time() - t0, 1)
+                final_metrics = {
+                    "test_loss": float("nan"),
+                    "test_acc": float("nan"),
+                    "elapsed_s": elapsed,
+                    "best_epoch": best_epoch,
+                    "diverged": True,
+                    "diverged_epoch": epoch,
+                }
+                if cfg.get("debug_diagnostics", False):
+                    final_metrics["diagnostics"] = diagnostics_log
+                return loss_curve, val_curve, final_metrics, dead_stats
+
+            grad_clip_norm = cfg.get("grad_clip_norm")
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
             apply_optimizer(
                 model,
                 cfg,
@@ -167,16 +222,46 @@ def run_experiment(cfg: dict, verbose=False, save_model=False,
         loss_curve.append([epoch, loss.item()])
 
         # ── Dead neuron statistics: training subset only ──────────────────────
-        stats = utils_math.compute_dead_neuron_stats(
-            model,
-            train_loader
-        )
+        stats_every = cfg.get("STATS_EVERY", 1)
+        if epoch % stats_every == 0 or epoch == cfg["EPOCHS"] - 1:
+            stats = utils_math.compute_dead_neuron_stats(
+                model,
+                validation_loader
+            )
 
-        dead_stats.append({
-            "epoch": epoch,
-            "fc1": stats["fc1"].cpu(),
-            "fc2": stats["fc2"].cpu(),
-        })
+            dead_stats.append({
+                "epoch": epoch,
+                "fc1": stats["fc1"].cpu(),
+                "fc2": stats["fc2"].cpu(),
+            })
+
+            # A layer where ~every unit is dead is an absorbing state for
+            # ReLU: no gradient can flow back through it, so the run can
+            # never recover via gradient descent. Rather than waiting out
+            # `patience` epochs on a network that's already decided,
+            # detect it directly and stop.
+            dead_layer_threshold = cfg.get("dead_layer_threshold")
+            if dead_layer_threshold is not None:
+                fc1_dead = stats["fc1"].mean().item()
+                fc2_dead = stats["fc2"].mean().item()
+                if fc1_dead >= dead_layer_threshold or fc2_dead >= dead_layer_threshold:
+                    print(
+                        f"[seed {seed}] epoch {epoch}: fc1={fc1_dead:.1%} / "
+                        f"fc2={fc2_dead:.1%} of units dead — aborting run."
+                    )
+                    elapsed = round(time.time() - t0, 1)
+                    final_metrics = {
+                        "test_loss": float("nan"),
+                        "test_acc": float("nan"),
+                        "elapsed_s": elapsed,
+                        "best_epoch": best_epoch,
+                        "diverged": False,
+                        "dead": True,
+                        "dead_epoch": epoch,
+                    }
+                    if cfg.get("debug_diagnostics", False):
+                        final_metrics["diagnostics"] = diagnostics_log
+                    return loss_curve, val_curve, final_metrics, dead_stats
 
         # ── Validation evaluation ────────────────────────────────────────────
         # The validation set comes exclusively from the original training set.
@@ -252,7 +337,10 @@ def run_experiment(cfg: dict, verbose=False, save_model=False,
         "test_acc": test_acc,
         "elapsed_s": elapsed,
         "best_epoch": best_epoch,
+        "diverged": False,
     }
+    if cfg.get("debug_diagnostics", False):
+        final_metrics["diagnostics"] = diagnostics_log
 
     if save_model:
         if run_name is None:
